@@ -1,0 +1,13 @@
+build/
+data/
+.git/
+.gradle/
+*.o
+*.a
+*.so
+*.dylib
+.DS_Store
+examples/spring-kotlin/.gradle/
+examples/spring-kotlin/.kotlin/
+examples/spring-kotlin/build/
+examples/spring-kotlin/out/
