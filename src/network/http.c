@@ -8,6 +8,7 @@
  */
 #include "helix/internal/http.h"
 #include "helix/internal/lease.h"
+#include "helix/internal/cache.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -34,6 +35,7 @@ struct hx_http_server {
     pthread_t            accept_thread;
     atomic_int           running;
     lease_registry_t    *registry;
+    hx_cache_t          *cache;
 };
 
 typedef struct {
@@ -96,6 +98,23 @@ static void send_response(int fd, int status, const char *reason,
 
 static void send_json(int fd, int status, const char *reason, const char *body) {
     send_response(fd, status, reason, "application/json", body);
+}
+
+/* Like send_response but for binary bodies of known length. */
+static void send_bytes(int fd, int status, const char *reason,
+                       const char *content_type,
+                       const void *body, size_t body_len) {
+    char hdr[512];
+    int n = snprintf(hdr, sizeof(hdr),
+                     "HTTP/1.1 %d %s\r\n"
+                     "Content-Type: %s\r\n"
+                     "Content-Length: %zu\r\n"
+                     "Connection: close\r\n"
+                     "\r\n",
+                     status, reason, content_type, body_len);
+    if (n < 0) return;
+    if (write_all(fd, hdr, (size_t)n) != 0) return;
+    if (body_len) write_all(fd, body, body_len);
 }
 
 /* --- request parsing ------------------------------------------------ */
@@ -192,23 +211,127 @@ static void handle_release(lease_registry_t *r, int fd, const char *body) {
     send_json(fd, 200, "OK", "{\"ok\":true}");
 }
 
-static void handle_stats(lease_registry_t *r, int fd) {
-    char resp[128];
-    snprintf(resp, sizeof(resp), "{\"active\":%zu,\"pending\":%zu}",
-             lease_active_count(r), lease_pending_count(r));
+static void handle_stats(lease_registry_t *r, hx_cache_t *c, int fd) {
+    char resp[256];
+    size_t active  = r ? lease_active_count(r)  : 0;
+    size_t pending = r ? lease_pending_count(r) : 0;
+    size_t csize   = c ? hx_cache_size(c)       : 0;
+    size_t chits   = c ? hx_cache_hits(c)       : 0;
+    size_t cmisses = c ? hx_cache_misses(c)     : 0;
+    snprintf(resp, sizeof(resp),
+             "{\"active\":%zu,\"pending\":%zu,"
+             "\"cache\":{\"size\":%zu,\"hits\":%zu,\"misses\":%zu}}",
+             active, pending, csize, chits, cmisses);
     send_json(fd, 200, "OK", resp);
+}
+
+/* In-place URL %XX decoding. Lenient: a malformed escape is left as-is. */
+static void url_decode_inplace(char *s) {
+    char *r = s, *w = s;
+    while (*r) {
+        if (*r == '%' && isxdigit((unsigned char)r[1]) && isxdigit((unsigned char)r[2])) {
+            char hex[3] = { r[1], r[2], '\0' };
+            *w++ = (char)strtol(hex, NULL, 16);
+            r += 3;
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = '\0';
+}
+
+/* Splits a request path of the form `/v1/cache/{key}[?ttl_ms=N]` into
+ *   key (caller-provided buffer, NUL-terminated, URL-decoded in place)
+ *   ttl_ms (0 if absent)
+ * Returns 1 on success, 0 if the path doesn't match.
+ *
+ * The HTTP request path is mutated to nul-terminate the key in place. */
+static int parse_cache_path(char *path, char **key_out, int *ttl_out) {
+    const char prefix[] = "/v1/cache/";
+    if (strncmp(path, prefix, sizeof(prefix) - 1) != 0) return 0;
+    char *key = path + sizeof(prefix) - 1;
+    if (*key == '\0') return 0;
+
+    *ttl_out = 0;
+    char *q = strchr(key, '?');
+    if (q) {
+        *q = '\0';
+        char *p = q + 1;
+        while (*p) {
+            if (strncmp(p, "ttl_ms=", 7) == 0) {
+                *ttl_out = atoi(p + 7);
+                break;
+            }
+            char *amp = strchr(p, '&');
+            if (!amp) break;
+            p = amp + 1;
+        }
+    }
+    url_decode_inplace(key);
+    *key_out = key;
+    return 1;
+}
+
+static void handle_cache_get(hx_cache_t *c, int fd, char *path) {
+    char *key; int ttl_unused;
+    if (!parse_cache_path(path, &key, &ttl_unused)) {
+        send_json(fd, 400, "Bad Request", "{\"error\":\"missing key\"}");
+        return;
+    }
+    size_t len = 0;
+    void *value = hx_cache_get(c, key, &len);
+    if (!value) {
+        send_json(fd, 404, "Not Found", "{\"error\":\"miss\"}");
+        return;
+    }
+    send_bytes(fd, 200, "OK", "application/octet-stream", value, len);
+    free(value);
+}
+
+static void handle_cache_put(hx_cache_t *c, int fd, char *path,
+                             const char *body, size_t body_len) {
+    char *key; int ttl_ms;
+    if (!parse_cache_path(path, &key, &ttl_ms)) {
+        send_json(fd, 400, "Bad Request", "{\"error\":\"missing key\"}");
+        return;
+    }
+    if (hx_cache_set(c, key, body, body_len, ttl_ms) != 0) {
+        send_json(fd, 500, "Internal Server Error", "{\"error\":\"set failed\"}");
+        return;
+    }
+    send_response(fd, 204, "No Content", "application/json", NULL);
+}
+
+static void handle_cache_delete(hx_cache_t *c, int fd, char *path) {
+    char *key; int ttl_unused;
+    if (!parse_cache_path(path, &key, &ttl_unused)) {
+        send_json(fd, 400, "Bad Request", "{\"error\":\"missing key\"}");
+        return;
+    }
+    if (hx_cache_delete(c, key) != 0) {
+        send_json(fd, 404, "Not Found", "{\"error\":\"miss\"}");
+        return;
+    }
+    send_response(fd, 204, "No Content", "application/json", NULL);
 }
 
 static void *conn_thread(void *arg) {
     conn_ctx_t *ctx = arg;
     hx_request_t req;
-    char body[2048];
+    /* Large enough for cached payloads (e.g. cached JSON list responses). */
+    char body[65536];
     if (read_request(ctx->fd, &req, body, sizeof(body)) == 0) {
         lease_registry_t *r = ctx->srv->registry;
+        hx_cache_t       *c = ctx->srv->cache;
+        int is_cache_path = strncmp(req.path, "/v1/cache/", 10) == 0;
+
         if      (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/v1/lease")   == 0) handle_lease(r, ctx->fd, body);
         else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/v1/release") == 0) handle_release(r, ctx->fd, body);
         else if (strcmp(req.method, "GET")  == 0 && strcmp(req.path, "/v1/health")  == 0) send_response(ctx->fd, 200, "OK", "text/plain", "ok");
-        else if (strcmp(req.method, "GET")  == 0 && strcmp(req.path, "/v1/stats")   == 0) handle_stats(r, ctx->fd);
+        else if (strcmp(req.method, "GET")  == 0 && strcmp(req.path, "/v1/stats")   == 0) handle_stats(r, c, ctx->fd);
+        else if (c && is_cache_path && strcmp(req.method, "GET")    == 0) handle_cache_get(c, ctx->fd, req.path);
+        else if (c && is_cache_path && strcmp(req.method, "PUT")    == 0) handle_cache_put(c, ctx->fd, req.path, body, (size_t)req.content_length);
+        else if (c && is_cache_path && strcmp(req.method, "DELETE") == 0) handle_cache_delete(c, ctx->fd, req.path);
         else send_json(ctx->fd, 404, "Not Found", "{\"error\":\"unknown route\"}");
     }
     close(ctx->fd);
@@ -242,7 +365,7 @@ static void *accept_loop(void *arg) {
     return NULL;
 }
 
-hx_http_server_t *hx_http_server_start(lease_registry_t *r, int port) {
+hx_http_server_t *hx_http_server_start(lease_registry_t *r, hx_cache_t *c, int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return NULL;
     int yes = 1;
@@ -263,6 +386,7 @@ hx_http_server_t *hx_http_server_start(lease_registry_t *r, int port) {
     s->listen_fd = fd;
     s->port      = port;
     s->registry  = r;
+    s->cache     = c;
     atomic_store(&s->running, 1);
     if (pthread_create(&s->accept_thread, NULL, accept_loop, s) != 0) {
         close(fd); free(s); return NULL;

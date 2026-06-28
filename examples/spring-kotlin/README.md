@@ -103,7 +103,32 @@ curl -s -w '%{http_code}\n' -o /dev/null \
 # 409
 ```
 
-### 4. Concurrent load — 200 buyers on one seat
+### 4. Read-side caching (cache-aside)
+
+The same Spring app uses `HelixCacheClient` for read-heavy endpoints:
+
+```sh
+curl -s localhost:8081/seats/VIP-001       # miss — fetched from repo, populated
+curl -s localhost:8081/seats/VIP-001       # hit  — served from Helix in-memory cache
+curl -s localhost:8081/seats                # list endpoint, same pattern
+```
+
+Stats:
+
+```sh
+curl -s http://localhost:9099/v1/stats
+# {"active":0,"pending":0,"cache":{"size":2,"hits":2,"misses":2}}
+```
+
+The reservation endpoint invalidates the affected cache entries on success so
+the next read observes the new state. TTLs default to 5 seconds; tune per
+endpoint.
+
+This is the standard cache-aside pattern — useful for "list" / "detail" page
+queries that hit the same DB rows repeatedly under load. For write contention,
+keep using the lease pattern (§5).
+
+### 5. Concurrent load — 200 buyers on one seat
 
 Reset and fire 200 reservations at the same seat in parallel:
 
@@ -127,7 +152,7 @@ Exactly one winner. The other 199 lost the lease race deterministically —
 they were behind in the Helix worker's FIFO and saw `reserved=true` by the
 time they ran.
 
-### 5. Concurrent load — 200 buyers across 50 seats
+### 6. Concurrent load — 200 buyers across 50 seats
 
 ```sh
 curl -s -X POST localhost:8081/seats/reset >/dev/null
