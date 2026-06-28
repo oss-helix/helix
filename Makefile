@@ -20,7 +20,7 @@ SRC_DIR   := src
 TEST_DIR  := tests
 EX_DIR    := examples
 
-SRCS := $(wildcard $(SRC_DIR)/*.c)
+SRCS := $(shell find $(SRC_DIR) -name '*.c')
 OBJS := $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(SRCS))
 
 LIB := $(BUILD_DIR)/libhelix.a
@@ -32,7 +32,9 @@ all: $(LIB)
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
 
+# Pattern rule needs the destination subdirectory to exist; mkdir -p is cheap.
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(LIB): $(OBJS)

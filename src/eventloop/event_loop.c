@@ -7,6 +7,7 @@
 #include "helix/internal/runtime.h"
 #include "helix/internal/queue.h"
 #include "helix/internal/hashmap.h"
+#include "helix/internal/wal.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -87,6 +88,22 @@ static void *worker_main(void *arg) {
         if (e) {
             helix_state_t st = { .entry = e, .worker = w };
             task.fn(&st, task.args);
+
+            /* After the handler runs, record the resulting state to the WAL.
+             * STATE_UPDATE when a value is installed, STATE_DELETE when not. */
+            if (w->wal) {
+                size_t klen = strlen(task.key);
+                if (klen <= UINT16_MAX) {
+                    if (e->value && e->value_size > 0) {
+                        (void)hx_wal_append(w->wal, HX_WAL_REC_STATE_UPDATE,
+                                            task.key, (uint16_t)klen,
+                                            e->value, (uint32_t)e->value_size);
+                    } else {
+                        (void)hx_wal_append(w->wal, HX_WAL_REC_STATE_DELETE,
+                                            task.key, (uint16_t)klen, NULL, 0);
+                    }
+                }
+            }
         }
         atomic_fetch_add_explicit(&w->processed, 1, memory_order_relaxed);
 
