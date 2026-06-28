@@ -73,34 +73,67 @@ No distributed lock required.
 
 ## Features
 
-Current:
+Implemented:
 
-- [ ] Event loop execution
-- [ ] Key based routing
-- [ ] In-memory state engine
+- [x] Event loop execution
+- [x] Key-based routing
+- [x] In-memory state engine
+- [x] Write-ahead log (CRC32, three fsync policies)
+- [x] Snapshot writer + WAL rotation
+- [x] Crash recovery (snapshot → WAL replay)
+- [x] HTTP lease daemon (per-key serialization over the wire)
+- [x] Read-through TTL cache
+- [x] Spring Boot + Kotlin reference client
+- [x] Docker / docker-compose deployment
 
 Planned:
 
-- [ ] WAL
-- [ ] Snapshot
 - [ ] Leader / Follower replication
-- [ ] Recovery
 - [ ] Cluster membership
-- [ ] Persistence adapters
+- [ ] Persistence adapters (Postgres / MySQL sinks)
 
 ---
 
-## Design Goal
+## When to use Helix
+
+Helix is purpose-built for **write contention**. Reach for it when:
+
+- Multiple requests fight over the same row (seat reservations, inventory
+  decrements, balance updates, idempotency tokens).
+- You'd otherwise reach for SELECT ... FOR UPDATE, Redis Redlock, or a
+  per-row mutex spread across app instances.
+- You want serialized writes per key but parallelism across keys, without
+  paying a DB-lock round trip.
+
+The TTL cache on top is a small read-side amenity for apps that already
+run Helix for write contention — not a Redis replacement.
+
+**Helix is not the right tool for:**
+
+- Pure read-heavy caching of HTTP responses → use a CDN (Cloudflare Cache
+  Rules, Fastly) or Redis with `@Cacheable`.
+- Pub/sub fan-out → Kafka, Redis Pub/Sub, NATS.
+- General-purpose KV / session store with large datasets → Redis.
+- Full-text search, analytics, time series → use specialized stores.
+
+If your bottleneck is "the list endpoint is slow", Helix is the wrong
+answer. If your bottleneck is "two users both bought the last seat",
+Helix is exactly the right answer.
+
+---
+
+## Design positioning
 
 Helix is not:
 
 - a database
 - a message broker
-- a cache
+- a Redis replacement
 
 Helix is:
 
-> A distributed state execution runtime.
+> A distributed state execution runtime with a per-key serialization
+> guarantee.
 
 ---
 
