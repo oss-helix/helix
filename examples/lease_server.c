@@ -18,6 +18,7 @@
 #include "helix/helix.h"
 #include "helix/internal/lease.h"
 #include "helix/internal/http.h"
+#include "helix/internal/cache.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -41,9 +42,16 @@ int main(int argc, char **argv) {
     lease_registry_t *reg = lease_registry_create(rt);
     if (!reg) { fprintf(stderr, "lease_registry_create failed\n"); helix_runtime_destroy(rt); return 1; }
 
-    hx_http_server_t *srv = hx_http_server_start(reg, port);
+    hx_cache_t *cache = hx_cache_create(0);
+    if (!cache) {
+        fprintf(stderr, "cache_create failed\n");
+        lease_registry_destroy(reg); helix_runtime_destroy(rt); return 1;
+    }
+
+    hx_http_server_t *srv = hx_http_server_start(reg, cache, port);
     if (!srv) {
         fprintf(stderr, "http_server_start failed on :%d (port in use?)\n", port);
+        hx_cache_destroy(cache);
         lease_registry_destroy(reg);
         helix_runtime_destroy(rt);
         return 1;
@@ -57,6 +65,7 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "\nshutting down...\n");
     hx_http_server_stop(srv);
+    hx_cache_destroy(cache);
     lease_registry_destroy(reg);
     helix_runtime_destroy(rt);
     return 0;

@@ -23,6 +23,8 @@ class SeatRepository {
 
     fun find(id: String): Seat = seats.computeIfAbsent(id) { Seat(id, false, null) }
 
+    fun findAll(): List<Seat> = seats.values.sortedBy { it.id }
+
     fun reserve(id: String, userId: String): Seat {
         val seat = find(id)
         if (seat.reserved) throw SeatAlreadyReservedException(id)
