@@ -1,122 +1,37 @@
 # Helix Specification
 
-## 1. Overview
+## Overview
 
-Helix is a distributed in-memory state runtime designed for high-concurrency
-systems.
+Helix is a distributed in-memory state runtime.
 
-The goal of Helix is to move concurrency control from the database layer to
-the runtime layer.
-
-Traditional architecture:
-
-```
-Request
-   |
-Application
-   |
-Database Lock / Transaction
-   |
-Storage
-```
-
-Helix architecture:
-
-```
-Request
-   |
-Helix Runtime
-   |
-In-Memory State Engine
-   |
-Replication
-   |
-Persistence Layer
-```
-
-Helix manages:
-
-- state execution
-- concurrency control
-- ordering
-- replication
-- recovery
+The purpose is to provide high performance state execution with deterministic
+concurrency control.
 
 ---
 
-## 2. Core Philosophy
+## Execution Model
 
-The database should not be the primary concurrency coordinator.
+Helix uses event-loop based execution.
 
-**Database responsibilities:**
+Each state key is assigned to a worker.
 
-- durability
-- recovery
-- long-term storage
-
-**Helix responsibilities:**
-
-- state mutation
-- ordering
-- concurrent execution
-- consistency
-
----
-
-## 3. Core Components
-
-### 3.1 Event Loop Engine
-
-Helix uses an event-loop-based execution model. Each state key is assigned
-to an execution context.
-
-```
-key = user:100
-   |
-   v
-EventLoop-3
-   |
-   v
-Sequential execution
-```
-
-Properties:
-
-- no global lock
-- single writer per key
-- deterministic execution order
-
-### 3.2 State Engine
-
-Helix maintains application state in memory.
-
-```
-State Store
-   order:100
-   { status: PAID, amount: 10000 }
-```
-
-Memory is the active state. Database persistence is asynchronous.
-
-### 3.3 Key Routing
-
-Every operation must provide a routing key.
-
-```
-order-100
-seat-A1
-inventory-10
-```
-
-Routing:
+Example:
 
 ```
 hash(key)
    |
-Execution Worker
+worker
 ```
 
-Guarantee — for the same key:
+The worker executes operations sequentially.
+
+---
+
+## Concurrency Model
+
+Guarantee:
+
+Same key:
 
 ```
 A
@@ -124,57 +39,82 @@ B
 C
 ```
 
-executes as `A -> B -> C`. Different keys execute concurrently.
+executes:
+
+```
+A -> B -> C
+```
+
+Different keys:
+
+```
+order-1
+order-2
+order-3
+```
+
+can execute concurrently.
 
 ---
 
-## 4. Replication Model
+## State Model
+
+Memory is the active state.
+
+Example:
+
+```
+user:100
+{
+  balance: 1000,
+  status: active
+}
+```
+
+Database persistence is separated.
+
+---
+
+## Replication
 
 Helix uses leader/follower replication.
 
 ```
-              Cluster
-
-               Leader
-                 |
-       +---------+---------+
-       |                   |
-    Replica             Replica
+   Leader
+     |
++----+----+
+|         |
+Follower  Follower
 ```
 
-Only the leader accepts writes.
+Leader handles writes.
 
-Flow:
+Followers maintain replicated state.
+
+---
+
+## Commit
+
+State changes are committed after replication.
 
 ```
-Client
-  |
-Leader
-  |
-Memory Update
-  |
+State Update
+     |
 Replication
-  |
-Follower ACK
-  |
-Commit
+     |
+  Commit
+     |
+ Response
 ```
 
 ---
 
-## 5. Log System
+## Recovery
 
-Memory alone cannot guarantee recovery. Helix uses append-only logs.
+Helix uses:
 
-```
-State Change
-   |
-Append Log
-   |
-Replication
-   |
-Commit Offset
-```
+- append log
+- snapshot
 
 Recovery:
 
@@ -184,121 +124,12 @@ Snapshot + Log Replay = State Restore
 
 ---
 
-## 6. Persistence
+## Non-Goals
 
-Persistence is decoupled.
+Helix is not intended to replace:
 
-Options:
+- SQL databases
+- Kafka
+- Redis
 
-- snapshot
-- write-ahead log
-- external database
-
-```
-Memory
-   |
-Async Flush
-   |
-Database
-```
-
----
-
-## 7. Failure Recovery
-
-When the leader fails:
-
-```
-Leader Down
-   |
-Replica Election
-   |
-New Leader
-   |
-Continue Processing
-```
-
-Requirements:
-
-- no lost committed state
-- prevent split brain
-- maintain ordering
-
----
-
-## 8. C Implementation Architecture
-
-```
-helix/
-  src/
-    core/
-      runtime.c
-      state.c
-      hashmap.c
-    eventloop/
-      event_loop.c
-      queue.c
-    cluster/
-      leader.c
-      replica.c
-      election.c
-    storage/
-      wal.c
-      snapshot.c
-      recovery.c
-    network/
-      protocol.c
-      transport.c
-```
-
-Phase-1 source code lives in `core/`, `eventloop/`, and `storage/`.
-`cluster/` and `network/` arrive in Phase 2.
-
----
-
-## 9. Memory Management
-
-Requirements:
-
-- zero-copy where possible
-- explicit allocation control
-- memory pool
-- configurable eviction
-
-No garbage collector dependency.
-
----
-
-## 10. API Concept
-
-```c
-helix_runtime_t *runtime;
-
-helix_execute(runtime, "order-100", update_order, args);
-```
-
-Execution guarantee:
-
-- same key → sequential
-- different key → parallel
-
----
-
-## 11. Non-Goals
-
-Helix is not:
-
-- a relational database
-- a message broker
-- a cache replacement
-
-Helix is: **a distributed state execution runtime.**
-
----
-
-## 12. Roadmap
-
-- **v0.1** — event loop, key routing, in-memory state
-- **v0.2** — WAL, snapshot, recovery
-- **v0.3** — replication, leader election
-- **v1.0** — production distributed state runtime
+It provides an execution layer above storage systems.

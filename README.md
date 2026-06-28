@@ -1,73 +1,130 @@
 # Helix
 
-**Distributed In-Memory State Runtime for High-Concurrency Applications**
+Distributed In-Memory State Runtime for High-Concurrency Applications.
 
-Helix moves application state out of the database and into the runtime.
-The database becomes a persistence layer; state lives in memory, replicated
-across nodes, with an append-only log for durability.
+Helix moves concurrency control from databases into an execution runtime.
+
+## Why Helix?
+
+Modern applications struggle with:
+
+- database row locks
+- transaction contention
+- distributed locks
+- ordering guarantees
+- high write workloads
+
+Helix provides a runtime layer that manages application state in memory.
 
 ```
-Client → Runtime → Distributed Memory → Database (Persistence Only)
+Request
+   |
+Helix Runtime
+   |
+In-Memory State
+   |
+Replication
+   |
+Persistence
 ```
 
-Built in C for maximum throughput and predictable latency.
+## Core Concepts
 
-## Why
+### Key-based Execution
 
-Most backend systems are built around the database. As concurrency grows,
-the bottleneck is always the same:
+Each state key owns an execution context.
 
-- Row locks
-- Transactions
-- Connection pools
-- Optimistic-lock retries
-- Deadlocks
-- Hot rows
+Example:
 
-Kafka, Redis, and message queues soften the problem but do not remove the
-database from the critical path. Helix does.
-
-## Programming model
-
-A key is owned by exactly one worker thread at a time. The runtime guarantees
-serial execution per key — no locks, no transactions, no retries in user code.
-
-```c
-helix_runtime_t *rt = helix_runtime_create(&cfg);
-
-helix_execute(rt, "order-42", pay_order, &args);  // serial w.r.t. "order-42"
-helix_execute(rt, "order-42", cancel_order, &args);
-helix_execute(rt, "order-42", refund_order, &args);
+```
+order:100
 ```
 
-## What the runtime owns
+is always processed by the same execution worker.
 
-- Routing (hash(key) → worker)
-- Ordering (single thread per key)
-- Concurrency (lock-free per-worker queues)
-- Write-ahead log
-- Snapshots
-- Recovery (snapshot + log replay)
-- Async persistence
-- Replication interface (Phase 2)
+Guarantees:
 
-The application writes business logic only.
+- same key → sequential execution
+- different keys → parallel execution
+
+No distributed lock required.
+
+---
+
+## Architecture
+
+```
+            Client
+              |
+        Helix Runtime
+              |
+       +----------------+
+       |   Event Loop   |
+       +----------------+
+              |
+        State Engine
+              |
+         Replication
+              |
+         Persistence
+```
+
+---
+
+## Features
+
+Current:
+
+- [ ] Event loop execution
+- [ ] Key based routing
+- [ ] In-memory state engine
+
+Planned:
+
+- [ ] WAL
+- [ ] Snapshot
+- [ ] Leader / Follower replication
+- [ ] Recovery
+- [ ] Cluster membership
+- [ ] Persistence adapters
+
+---
+
+## Design Goal
+
+Helix is not:
+
+- a database
+- a message broker
+- a cache
+
+Helix is:
+
+> A distributed state execution runtime.
+
+---
+
+## Language
+
+Helix is implemented in C.
+
+Goals:
+
+- predictable latency
+- explicit memory management
+- zero-copy where possible
+- low overhead runtime
+
+---
 
 ## Status
 
-Phase 1 (single-node core) — in progress. See `docs/ARCHITECTURE.md` and
-`docs/ROADMAP.md`.
+Early development.
 
-## Build
+APIs and architecture may change.
 
-```sh
-make
-make test
-make example
-```
-
-Requires a C11 compiler and POSIX threads. Tested on macOS and Linux.
+---
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Apache License 2.0
