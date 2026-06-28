@@ -1,0 +1,11 @@
+server:
+  port: 8081
+
+helix:
+  daemon-url: http://localhost:9099
+
+# Uncomment on JDK 21+ to serve incoming requests on virtual threads.
+# spring:
+#   threads:
+#     virtual:
+#       enabled: true
