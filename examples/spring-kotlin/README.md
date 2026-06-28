@@ -42,6 +42,18 @@ run in parallel — there is no cross-key contention.
 
 ## Running
 
+### Option 1 — Docker (zero local deps)
+
+From the repo root:
+
+```sh
+docker compose up --build
+```
+
+Skip to **§3 Try a single reservation** below.
+
+### Option 2 — Native
+
 You need:
 
 - A C toolchain to build the Helix daemon (`cc`, `make`, POSIX threads)

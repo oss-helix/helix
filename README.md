@@ -117,6 +117,29 @@ Goals:
 
 ---
 
+## Docker quick start
+
+The repo ships a `docker-compose.yml` that runs the lease daemon and the
+Spring Boot demo together. No local C toolchain or JDK required:
+
+```sh
+docker compose up --build
+```
+
+Then load-test:
+
+```sh
+seq 1 200 | xargs -P 50 -I{} curl -s -o /dev/null -w '%{http_code}\n' \
+  -X POST localhost:8081/seats/VIP-001/reserve \
+  -H 'Content-Type: application/json' \
+  -d '{"userId":"user-{}"}' | sort | uniq -c
+# 1 200
+# 199 409
+```
+
+Exactly one winner — the other 199 lost the lease race deterministically.
+See `examples/spring-kotlin/README.md` for the full walkthrough.
+
 ## Status
 
 Early development.

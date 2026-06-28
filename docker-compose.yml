@@ -1,0 +1,38 @@
+# Helix end-to-end demo.
+#
+#   docker compose up --build
+#
+# Then load-test against http://localhost:8081/seats/...  (see README §
+# "Docker quick start").
+
+services:
+  helix-daemon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: helix-daemon
+    environment:
+      HELIX_PORT: "9099"
+      HELIX_WORKERS: "64"
+    ports:
+      - "9099:9099"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9099/v1/health"]
+      interval: 2s
+      timeout: 1s
+      start_period: 2s
+      retries: 10
+
+  spring-app:
+    build:
+      context: examples/spring-kotlin
+      dockerfile: Dockerfile
+    container_name: helix-spring-demo
+    depends_on:
+      helix-daemon:
+        condition: service_healthy
+    environment:
+      HELIX_DAEMON_URL: http://helix-daemon:9099
+      SERVER_PORT: "8081"
+    ports:
+      - "8081:8081"
