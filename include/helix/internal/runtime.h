@@ -22,6 +22,7 @@ typedef struct hx_worker {
     helix_runtime_t   *runtime;     /* parent */
     struct hx_queue   *queue;       /* submission queue, opaque for now */
     hx_hashmap_t      *shard;       /* state owned by this worker */
+    struct hx_wal     *wal;         /* per-worker WAL, NULL when disabled */
     atomic_size_t      processed;   /* lifetime processed count, for metrics */
 } hx_worker_t;
 
@@ -30,7 +31,6 @@ struct helix_runtime {
     size_t           worker_count;
     hx_worker_t     *workers;
     atomic_int       running;       /* 1 while workers should run */
-    struct hx_wal   *wal;           /* NULL until WAL branch */
 };
 
 /* helix_state_t is the per-call handle handed to handlers. It points into the

@@ -1,9 +1,13 @@
 #include "helix/helix.h"
 #include "helix/internal/runtime.h"
 #include "helix/internal/hashmap.h"
+#include "helix/internal/wal.h"
 
+#include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 helix_config_t helix_config_default(void) {
@@ -36,6 +40,15 @@ helix_runtime_t *helix_runtime_create(const helix_config_t *user_cfg) {
     rt->workers = calloc(cfg.worker_count, sizeof(hx_worker_t));
     if (!rt->workers) { free(rt); return NULL; }
 
+    /* Best-effort mkdir for data_dir; we don't recurse — caller is responsible
+     * for any parent directories. */
+    if (cfg.data_dir && cfg.wal_mode != HELIX_WAL_OFF) {
+        if (mkdir(cfg.data_dir, 0755) != 0 && errno != EEXIST) {
+            free(rt->workers); free(rt);
+            return NULL;
+        }
+    }
+
     for (size_t i = 0; i < cfg.worker_count; ++i) {
         hx_worker_t *w = &rt->workers[i];
         w->id = i;
@@ -43,12 +56,26 @@ helix_runtime_t *helix_runtime_create(const helix_config_t *user_cfg) {
         w->shard = hx_hashmap_create(256);
         atomic_store(&w->processed, 0);
         if (!w->shard) {
-            for (size_t j = 0; j < i; ++j) hx_hashmap_destroy(rt->workers[j].shard);
-            free(rt->workers);
-            free(rt);
+            for (size_t j = 0; j < i; ++j) {
+                hx_hashmap_destroy(rt->workers[j].shard);
+                hx_wal_close(rt->workers[j].wal);
+            }
+            free(rt->workers); free(rt);
             return NULL;
         }
-        /* w->queue and w->thread are spun up by the event-loop module. */
+        if (cfg.data_dir && cfg.wal_mode != HELIX_WAL_OFF) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/wal-%zu.log", cfg.data_dir, i);
+            w->wal = hx_wal_open(path, cfg.wal_mode, cfg.wal_batch_size);
+            if (!w->wal) {
+                for (size_t j = 0; j <= i; ++j) {
+                    hx_hashmap_destroy(rt->workers[j].shard);
+                    if (j < i) hx_wal_close(rt->workers[j].wal);
+                }
+                free(rt->workers); free(rt);
+                return NULL;
+            }
+        }
     }
 
     /* Worker threads start when the event-loop module attaches itself.
@@ -63,32 +90,11 @@ void helix_runtime_destroy(helix_runtime_t *rt) {
     if (!rt) return;
     hx_event_loop_shutdown(rt);
     for (size_t i = 0; i < rt->worker_count; ++i) {
+        hx_wal_close(rt->workers[i].wal);
         hx_hashmap_destroy(rt->workers[i].shard);
     }
     free(rt->workers);
     free(rt);
 }
 
-/* --- State accessors --------------------------------------------------- */
-
-void *helix_state_get(helix_state_t *s) {
-    return s && s->entry ? s->entry->value : NULL;
-}
-
-void helix_state_set(helix_state_t *s, void *value, size_t size, void (*free_fn)(void *)) {
-    if (!s || !s->entry) return;
-    if (s->entry->free_fn && s->entry->value && s->entry->value != value) {
-        s->entry->free_fn(s->entry->value);
-    }
-    s->entry->value      = value;
-    s->entry->value_size = size;
-    s->entry->free_fn    = free_fn;
-}
-
-const char *helix_state_key(const helix_state_t *s) {
-    return (s && s->entry) ? s->entry->key : NULL;
-}
-
-size_t helix_state_value_size(const helix_state_t *s) {
-    return (s && s->entry) ? s->entry->value_size : 0;
-}
+/* State accessors live in src/core/state.c per SPEC.md §8. */
