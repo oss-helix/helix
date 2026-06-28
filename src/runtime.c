@@ -56,29 +56,17 @@ helix_runtime_t *helix_runtime_create(const helix_config_t *user_cfg) {
     return rt;
 }
 
+/* Implemented in event_loop.c. Joins worker threads if any were started. */
+void hx_event_loop_shutdown(helix_runtime_t *rt);
+
 void helix_runtime_destroy(helix_runtime_t *rt) {
     if (!rt) return;
-    /* Stop signal — the event loop module will react when it lands. */
-    atomic_store(&rt->running, 0);
+    hx_event_loop_shutdown(rt);
     for (size_t i = 0; i < rt->worker_count; ++i) {
         hx_hashmap_destroy(rt->workers[i].shard);
     }
     free(rt->workers);
     free(rt);
-}
-
-/* --- Stubs filled in by feature/event-loop ----------------------------- */
-
-int helix_execute(helix_runtime_t *rt, const char *key,
-                  helix_handler_t fn, void *args) {
-    (void)rt; (void)key; (void)fn; (void)args;
-    return -1;
-}
-
-int helix_execute_sync(helix_runtime_t *rt, const char *key,
-                       helix_handler_t fn, void *args) {
-    (void)rt; (void)key; (void)fn; (void)args;
-    return -1;
 }
 
 /* --- State accessors --------------------------------------------------- */
