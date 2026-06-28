@@ -96,29 +96,21 @@ Planned:
 
 ## When to use Helix
 
-Helix is purpose-built for **write contention**. Reach for it when:
+Helix targets two problems that show up together in high-traffic backends:
 
-- Multiple requests fight over the same row (seat reservations, inventory
-  decrements, balance updates, idempotency tokens).
-- You'd otherwise reach for SELECT ... FOR UPDATE, Redis Redlock, or a
-  per-row mutex spread across app instances.
-- You want serialized writes per key but parallelism across keys, without
-  paying a DB-lock round trip.
+**Write contention.** Multiple requests fight over the same row — seat
+reservations, inventory decrements, balance updates, idempotency tokens.
+The lease daemon serializes all writers for a given key, in submission
+order, across every application instance. No DB row lock, no distributed
+mutex library, no retry loop in application code.
 
-The TTL cache on top is a small read-side amenity for apps that already
-run Helix for write contention — not a Redis replacement.
+**Read-heavy hotspots.** The same list / detail / discovery page hammered
+by thousands of concurrent users. The TTL cache module serves repeated
+reads from memory with per-entry expiry and cache-aside semantics, so
+the DB sees one read per cache miss instead of one read per request.
 
-**Helix is not the right tool for:**
-
-- Pure read-heavy caching of HTTP responses → use a CDN (Cloudflare Cache
-  Rules, Fastly) or Redis with `@Cacheable`.
-- Pub/sub fan-out → Kafka, Redis Pub/Sub, NATS.
-- General-purpose KV / session store with large datasets → Redis.
-- Full-text search, analytics, time series → use specialized stores.
-
-If your bottleneck is "the list endpoint is slow", Helix is the wrong
-answer. If your bottleneck is "two users both bought the last seat",
-Helix is exactly the right answer.
+Both run on the same daemon and share the same key space, so the
+application gets a single coordination point for both problems.
 
 ---
 
@@ -128,12 +120,11 @@ Helix is not:
 
 - a database
 - a message broker
-- a Redis replacement
 
 Helix is:
 
-> A distributed state execution runtime with a per-key serialization
-> guarantee.
+> A distributed state execution runtime — per-key serialization for
+> writes, TTL cache for reads, one daemon for both.
 
 ---
 
