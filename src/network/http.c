@@ -9,6 +9,9 @@
 #include "helix/internal/http.h"
 #include "helix/internal/lease.h"
 #include "helix/internal/cache.h"
+#include "helix/internal/runtime.h"
+
+#include <stdarg.h>
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -34,6 +37,8 @@ struct hx_http_server {
     int                  port;
     pthread_t            accept_thread;
     atomic_int           running;
+    atomic_int           draining;
+    helix_runtime_t     *runtime;
     lease_registry_t    *registry;
     hx_cache_t          *cache;
 };
@@ -315,25 +320,214 @@ static void handle_cache_delete(hx_cache_t *c, int fd, char *path) {
     send_response(fd, 204, "No Content", "application/json", NULL);
 }
 
+/* Extracts a named query param from a path of the form `...?a=1&b=2`.
+ * Writes the (URL-decoded) value into `out` (capacity `out_cap`).
+ * Returns 1 on success, 0 if absent. Non-destructive on `path`. */
+static int query_param(const char *path, const char *name,
+                       char *out, size_t out_cap) {
+    const char *q = strchr(path, '?');
+    if (!q) return 0;
+    size_t nlen = strlen(name);
+    const char *p = q + 1;
+    while (*p) {
+        if (strncmp(p, name, nlen) == 0 && p[nlen] == '=') {
+            const char *v = p + nlen + 1;
+            size_t i = 0;
+            while (*v && *v != '&' && i + 1 < out_cap) out[i++] = *v++;
+            out[i] = '\0';
+            url_decode_inplace(out);
+            return i > 0;
+        }
+        const char *amp = strchr(p, '&');
+        if (!amp) break;
+        p = amp + 1;
+    }
+    return 0;
+}
+
+static void handle_idempotent(hx_cache_t *c, int fd, const char *path,
+                              const char *body, size_t body_len) {
+    char key[256], ttl_buf[16];
+    if (!query_param(path, "key", key, sizeof(key))) {
+        send_json(fd, 400, "Bad Request", "{\"error\":\"missing key\"}");
+        return;
+    }
+    int ttl_ms = 300000;  /* default 5 minutes */
+    if (query_param(path, "ttl_ms", ttl_buf, sizeof(ttl_buf))) ttl_ms = atoi(ttl_buf);
+
+    size_t stored_len = 0;
+    int    was_new    = 0;
+    void  *prior = hx_cache_get_or_set(c, key, body, body_len, ttl_ms,
+                                       &stored_len, &was_new);
+    if (was_new) {
+        /* First call — body was stored, echo it back with 201. */
+        send_bytes(fd, 201, "Created", "application/octet-stream", body, body_len);
+    } else if (prior) {
+        /* Replay — return the memoized response. */
+        send_bytes(fd, 200, "OK", "application/octet-stream", prior, stored_len);
+        free(prior);
+    } else {
+        send_json(fd, 500, "Internal Server Error", "{\"error\":\"idempotency lookup failed\"}");
+    }
+}
+
+static void handle_atomic_incr(hx_cache_t *c, int fd, const char *body) {
+    char key[256], by_buf[24], ttl_buf[16];
+    if (!json_field(body, "key", key, sizeof(key))) {
+        send_json(fd, 400, "Bad Request", "{\"error\":\"missing key\"}"); return;
+    }
+    long long by = 1;
+    if (json_field(body, "by", by_buf, sizeof(by_buf))) by = strtoll(by_buf, NULL, 10);
+    int ttl_ms = 0;
+    if (json_field(body, "ttl_ms", ttl_buf, sizeof(ttl_buf))) ttl_ms = atoi(ttl_buf);
+
+    long long out_value = 0;
+    if (hx_cache_atomic_incr(c, key, by, ttl_ms, &out_value) != 0) {
+        send_json(fd, 409, "Conflict", "{\"error\":\"current value is not an integer\"}");
+        return;
+    }
+    char resp[64];
+    snprintf(resp, sizeof(resp), "{\"value\":%lld}", out_value);
+    send_json(fd, 200, "OK", resp);
+}
+
+static void handle_atomic_cas(hx_cache_t *c, int fd, const char *body) {
+    char key[256], expected[512], next[512], ttl_buf[16];
+    if (!json_field(body, "key", key, sizeof(key))) {
+        send_json(fd, 400, "Bad Request", "{\"error\":\"missing key\"}"); return;
+    }
+    /* expected may legitimately be empty — interpret as "absent". */
+    expected[0] = '\0';
+    json_field(body, "expected", expected, sizeof(expected));
+    if (!json_field(body, "next", next, sizeof(next))) {
+        send_json(fd, 400, "Bad Request", "{\"error\":\"missing next\"}"); return;
+    }
+    int ttl_ms = 0;
+    if (json_field(body, "ttl_ms", ttl_buf, sizeof(ttl_buf))) ttl_ms = atoi(ttl_buf);
+
+    int swapped = 0;
+    int rc = hx_cache_atomic_cas(c, key,
+                                 expected, strlen(expected),
+                                 next, strlen(next),
+                                 ttl_ms, &swapped);
+    if (rc != 0) {
+        send_json(fd, 500, "Internal Server Error", "{\"error\":\"cas failed\"}");
+        return;
+    }
+    char resp[32];
+    snprintf(resp, sizeof(resp), "{\"swapped\":%s}", swapped ? "true" : "false");
+    send_json(fd, 200, "OK", resp);
+}
+
+static void metrics_appendf(char *buf, size_t cap, size_t *off,
+                            const char *fmt, ...) {
+    if (*off >= cap) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + *off, cap - *off, fmt, ap);
+    va_end(ap);
+    if (n > 0 && (size_t)n < cap - *off) *off += (size_t)n;
+}
+
+static void handle_metrics(hx_http_server_t *s, int fd) {
+    /* Prometheus text exposition format. Keep this small — no histograms
+     * for the MVP, just gauges + counters from the live state. */
+    char buf[4096];
+    size_t off = 0;
+
+    if (s->cache) {
+        metrics_appendf(buf, sizeof(buf), &off,
+            "# HELP helix_cache_size Number of entries currently in the cache\n"
+            "# TYPE helix_cache_size gauge\n"
+            "helix_cache_size %zu\n", hx_cache_size(s->cache));
+        metrics_appendf(buf, sizeof(buf), &off,
+            "# HELP helix_cache_hits_total Cumulative cache GET hits\n"
+            "# TYPE helix_cache_hits_total counter\n"
+            "helix_cache_hits_total %zu\n", hx_cache_hits(s->cache));
+        metrics_appendf(buf, sizeof(buf), &off,
+            "# HELP helix_cache_misses_total Cumulative cache GET misses\n"
+            "# TYPE helix_cache_misses_total counter\n"
+            "helix_cache_misses_total %zu\n", hx_cache_misses(s->cache));
+    }
+    if (s->registry) {
+        metrics_appendf(buf, sizeof(buf), &off,
+            "# HELP helix_lease_active Currently held leases\n"
+            "# TYPE helix_lease_active gauge\n"
+            "helix_lease_active %zu\n", lease_active_count(s->registry));
+        metrics_appendf(buf, sizeof(buf), &off,
+            "# HELP helix_lease_pending Callers parked in /v1/lease awaiting their turn\n"
+            "# TYPE helix_lease_pending gauge\n"
+            "helix_lease_pending %zu\n", lease_pending_count(s->registry));
+    }
+    if (s->runtime) {
+        metrics_appendf(buf, sizeof(buf), &off,
+            "# HELP helix_workers Number of event-loop worker threads\n"
+            "# TYPE helix_workers gauge\n"
+            "helix_workers %zu\n", s->runtime->worker_count);
+    }
+    metrics_appendf(buf, sizeof(buf), &off,
+        "# HELP helix_draining 1 if the server has begun shutdown drain, else 0\n"
+        "# TYPE helix_draining gauge\n"
+        "helix_draining %d\n", atomic_load(&s->draining));
+
+    send_response(fd, 200, "OK", "text/plain; version=0.0.4", buf);
+}
+
+/* Drain check — used to short-circuit write routes during shutdown. */
+static int draining(const hx_http_server_t *s) {
+    return atomic_load(&s->draining);
+}
+
+/* Splits "/v1/idempotent?..." into just the path prefix for matching. */
+static int path_starts_with(const char *path, const char *prefix) {
+    size_t n = strlen(prefix);
+    return strncmp(path, prefix, n) == 0 &&
+           (path[n] == '\0' || path[n] == '?' || path[n] == '/');
+}
+
 static void *conn_thread(void *arg) {
     conn_ctx_t *ctx = arg;
     hx_request_t req;
     /* Large enough for cached payloads (e.g. cached JSON list responses). */
     char body[65536];
     if (read_request(ctx->fd, &req, body, sizeof(body)) == 0) {
-        lease_registry_t *r = ctx->srv->registry;
-        hx_cache_t       *c = ctx->srv->cache;
+        hx_http_server_t *s = ctx->srv;
+        lease_registry_t *r = s->registry;
+        hx_cache_t       *c = s->cache;
         int is_cache_path = strncmp(req.path, "/v1/cache/", 10) == 0;
+
+        /* Write-y routes refuse new work while draining. */
+        int is_write_route =
+            (strcmp(req.method, "POST") == 0 &&
+                (strcmp(req.path, "/v1/lease") == 0 ||
+                 strcmp(req.path, "/v1/release") == 0 ||
+                 path_starts_with(req.path, "/v1/idempotent") ||
+                 path_starts_with(req.path, "/v1/atomic"))) ||
+            (is_cache_path && (strcmp(req.method, "PUT") == 0 ||
+                               strcmp(req.method, "DELETE") == 0));
+        if (is_write_route && draining(s)) {
+            send_json(ctx->fd, 503, "Service Unavailable",
+                      "{\"error\":\"draining\"}");
+            goto done;
+        }
 
         if      (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/v1/lease")   == 0) handle_lease(r, ctx->fd, body);
         else if (strcmp(req.method, "POST") == 0 && strcmp(req.path, "/v1/release") == 0) handle_release(r, ctx->fd, body);
+        else if (c && strcmp(req.method, "POST") == 0 && path_starts_with(req.path, "/v1/idempotent"))
+            handle_idempotent(c, ctx->fd, req.path, body, (size_t)req.content_length);
+        else if (c && strcmp(req.method, "POST") == 0 && strcmp(req.path, "/v1/atomic/incr") == 0)
+            handle_atomic_incr(c, ctx->fd, body);
+        else if (c && strcmp(req.method, "POST") == 0 && strcmp(req.path, "/v1/atomic/cas") == 0)
+            handle_atomic_cas(c, ctx->fd, body);
         else if (strcmp(req.method, "GET")  == 0 && strcmp(req.path, "/v1/health")  == 0) send_response(ctx->fd, 200, "OK", "text/plain", "ok");
         else if (strcmp(req.method, "GET")  == 0 && strcmp(req.path, "/v1/stats")   == 0) handle_stats(r, c, ctx->fd);
+        else if (strcmp(req.method, "GET")  == 0 && strcmp(req.path, "/v1/metrics") == 0) handle_metrics(s, ctx->fd);
         else if (c && is_cache_path && strcmp(req.method, "GET")    == 0) handle_cache_get(c, ctx->fd, req.path);
         else if (c && is_cache_path && strcmp(req.method, "PUT")    == 0) handle_cache_put(c, ctx->fd, req.path, body, (size_t)req.content_length);
         else if (c && is_cache_path && strcmp(req.method, "DELETE") == 0) handle_cache_delete(c, ctx->fd, req.path);
         else send_json(ctx->fd, 404, "Not Found", "{\"error\":\"unknown route\"}");
     }
+done:
     close(ctx->fd);
     free(ctx);
     return NULL;
@@ -365,7 +559,10 @@ static void *accept_loop(void *arg) {
     return NULL;
 }
 
-hx_http_server_t *hx_http_server_start(lease_registry_t *r, hx_cache_t *c, int port) {
+hx_http_server_t *hx_http_server_start(helix_runtime_t *rt,
+                                        lease_registry_t *r,
+                                        hx_cache_t *c,
+                                        int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return NULL;
     int yes = 1;
@@ -385,13 +582,20 @@ hx_http_server_t *hx_http_server_start(lease_registry_t *r, hx_cache_t *c, int p
     if (!s) { close(fd); return NULL; }
     s->listen_fd = fd;
     s->port      = port;
+    s->runtime   = rt;
     s->registry  = r;
     s->cache     = c;
+    atomic_store(&s->draining, 0);
     atomic_store(&s->running, 1);
     if (pthread_create(&s->accept_thread, NULL, accept_loop, s) != 0) {
         close(fd); free(s); return NULL;
     }
     return s;
+}
+
+void hx_http_server_drain(hx_http_server_t *s) {
+    if (!s) return;
+    atomic_store(&s->draining, 1);
 }
 
 void hx_http_server_stop(hx_http_server_t *s) {

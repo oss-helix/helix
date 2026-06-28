@@ -100,8 +100,12 @@ Implemented:
 - [x] Snapshot writer + WAL rotation
 - [x] Crash recovery (snapshot → WAL replay)
 - [x] HTTP lease daemon (per-key serialization over the wire)
-- [x] Read-through TTL cache
-- [x] Spring Boot + Kotlin reference client
+- [x] Read-through TTL cache (ephemeral or WAL-persistent)
+- [x] Idempotency endpoint (`POST /v1/idempotent`)
+- [x] Atomic ops (`POST /v1/atomic/{incr,cas}`)
+- [x] Prometheus metrics (`GET /v1/metrics`)
+- [x] Graceful shutdown / drain mode on SIGTERM
+- [x] Spring Boot + Kotlin reference client (lease / cache / idempotent / atomic)
 - [x] Docker / docker-compose deployment
 
 Planned:
