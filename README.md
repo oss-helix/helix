@@ -1,9 +1,14 @@
 # Helix
 
-> **One runtime for fast reads and safe writes.**
+> **A runtime layer that manages application state safely and efficiently.**
 
-Helix is a lightweight state runtime that combines high-performance
-in-memory access with per-key concurrency control.
+Helix is a lightweight state runtime that combines cache-speed reads,
+safe per-key writes, atomic state mutation, request deduplication, and
+durable recovery into one daemon.
+
+See [`DIRECTION.md`](DIRECTION.md) for the full project direction —
+problem framing, target users, feature set, roadmap, and long-term
+vision.
 
 ```
                 Application
@@ -71,6 +76,9 @@ The two paths are unified at the daemon boundary but distinct internally:
 Mixing the two as a single primitive invites subtle consistency bugs
 under load. They share the same key space and the same daemon but the
 underlying mechanics stay separate.
+
+Helix is not a relational database, not a message broker, and not a
+Redis replacement. It is a runtime layer for application state.
 
 ## Why this shape
 
