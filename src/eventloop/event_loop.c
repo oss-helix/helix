@@ -8,11 +8,14 @@
 #include "helix/internal/queue.h"
 #include "helix/internal/hashmap.h"
 #include "helix/internal/wal.h"
+#include "helix/internal/snapshot.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* Forward declarations of internal worker plumbing. */
 static void *worker_main(void *arg);
@@ -106,6 +109,32 @@ static void *worker_main(void *arg) {
             }
         }
         atomic_fetch_add_explicit(&w->processed, 1, memory_order_relaxed);
+
+        /* Periodic snapshot — runs inline on the worker thread, which blocks
+         * further submissions for this worker briefly. The single-thread-per-
+         * key invariant means the shard is consistent at this point. */
+        const helix_config_t *cfg = &w->runtime->cfg;
+        if (cfg->snapshot_interval > 0 && cfg->data_dir) {
+            w->since_snapshot++;
+            if (w->since_snapshot >= cfg->snapshot_interval) {
+                char snap_path[1024];
+                char wal_path[1024];
+                snprintf(snap_path, sizeof(snap_path), "%s/snapshot-%zu.snap",
+                         cfg->data_dir, w->id);
+                snprintf(wal_path,  sizeof(wal_path),  "%s/wal-%zu.log",
+                         cfg->data_dir, w->id);
+                if (hx_snapshot_write(snap_path, w->shard) == 0) {
+                    /* Rotate the WAL: close, unlink, reopen empty. */
+                    if (w->wal) {
+                        hx_wal_close(w->wal);
+                        unlink(wal_path);
+                        w->wal = hx_wal_open(wal_path, cfg->wal_mode,
+                                             cfg->wal_batch_size);
+                    }
+                    w->since_snapshot = 0;
+                }
+            }
+        }
 
         if (task.sync_mu) {
             pthread_mutex_lock(task.sync_mu);

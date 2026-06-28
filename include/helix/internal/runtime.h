@@ -24,6 +24,7 @@ typedef struct hx_worker {
     hx_hashmap_t      *shard;       /* state owned by this worker */
     struct hx_wal     *wal;         /* per-worker WAL, NULL when disabled */
     atomic_size_t      processed;   /* lifetime processed count, for metrics */
+    size_t             since_snapshot;  /* commits since last snapshot */
 } hx_worker_t;
 
 struct helix_runtime {
