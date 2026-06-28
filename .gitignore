@@ -1,0 +1,16 @@
+build/
+*.o
+*.a
+*.so
+*.dylib
+*.dSYM/
+helix_test
+helix_example
+example_order
+data/
+*.wal
+*.snap
+.DS_Store
+compile_commands.json
+.vscode/
+.idea/
