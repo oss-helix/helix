@@ -103,6 +103,25 @@ curl -s -w '%{http_code}\n' -o /dev/null \
 # 409
 ```
 
+### Other Helix clients
+
+Alongside `HelixLeaseClient` and `HelixCacheClient`, two more clients ship
+for the v0.4 endpoints:
+
+```kotlin
+// Idempotency — make a side-effecting block run exactly once per key.
+val receipt = helix.dedupe("payment:tx-abc", ttlMs = 60_000, Receipt::class.java) {
+    paymentGateway.charge(...)         // runs once, even under retries
+}
+
+// Atomic ops — no Lua scripts.
+val newCount = atomic.incr("metrics:home-views", by = 1, ttlMs = 3_600_000)
+val swapped  = atomic.cas("order:42:status", expected = "PAID", next = "REFUNDED")
+```
+
+The daemon also exposes Prometheus metrics at `GET /v1/metrics`
+(cache hits/misses, lease active/pending, worker count, draining flag).
+
 ### 4. Read-side caching (cache-aside)
 
 The same Spring app uses `HelixCacheClient` for read-heavy endpoints:

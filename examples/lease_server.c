@@ -42,13 +42,21 @@ int main(int argc, char **argv) {
     lease_registry_t *reg = lease_registry_create(rt);
     if (!reg) { fprintf(stderr, "lease_registry_create failed\n"); helix_runtime_destroy(rt); return 1; }
 
-    hx_cache_t *cache = hx_cache_create(0);
+    /* Persistent cache when HELIX_CACHE_WAL is set, else in-memory only. */
+    const char *cache_wal = getenv("HELIX_CACHE_WAL");
+    hx_cache_t *cache;
+    if (cache_wal && *cache_wal) {
+        cache = hx_cache_create_persistent(0, cache_wal, HELIX_WAL_BATCHED, 64);
+        if (cache) fprintf(stderr, "cache persistence: %s (BATCHED)\n", cache_wal);
+    } else {
+        cache = hx_cache_create(0);
+    }
     if (!cache) {
         fprintf(stderr, "cache_create failed\n");
         lease_registry_destroy(reg); helix_runtime_destroy(rt); return 1;
     }
 
-    hx_http_server_t *srv = hx_http_server_start(reg, cache, port);
+    hx_http_server_t *srv = hx_http_server_start(rt, reg, cache, port);
     if (!srv) {
         fprintf(stderr, "http_server_start failed on :%d (port in use?)\n", port);
         hx_cache_destroy(cache);
@@ -63,7 +71,19 @@ int main(int argc, char **argv) {
 
     while (!g_stop) sleep(1);
 
-    fprintf(stderr, "\nshutting down...\n");
+    /* Graceful drain — reject new write work, then give in-flight leases a
+     * short window (default 10s, override via HELIX_DRAIN_TIMEOUT) to release
+     * before we shut the server down. */
+    fprintf(stderr, "\ndraining...\n");
+    hx_http_server_drain(srv);
+    int drain_timeout = 10;
+    const char *env_to = getenv("HELIX_DRAIN_TIMEOUT");
+    if (env_to) drain_timeout = atoi(env_to);
+    for (int i = 0; i < drain_timeout; ++i) {
+        if (lease_active_count(reg) == 0 && lease_pending_count(reg) == 0) break;
+        sleep(1);
+    }
+    fprintf(stderr, "shutting down...\n");
     hx_http_server_stop(srv);
     hx_cache_destroy(cache);
     lease_registry_destroy(reg);
