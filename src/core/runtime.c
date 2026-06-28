@@ -2,6 +2,7 @@
 #include "helix/internal/runtime.h"
 #include "helix/internal/hashmap.h"
 #include "helix/internal/wal.h"
+#include "helix/internal/snapshot.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -62,6 +63,18 @@ helix_runtime_t *helix_runtime_create(const helix_config_t *user_cfg) {
             }
             free(rt->workers); free(rt);
             return NULL;
+        }
+        if (cfg.data_dir) {
+            /* Recover any prior snapshot + WAL into this worker's shard
+             * before the WAL is opened for append. */
+            if (hx_recovery_load(cfg.data_dir, i, w->shard) != 0) {
+                for (size_t j = 0; j <= i; ++j) {
+                    hx_hashmap_destroy(rt->workers[j].shard);
+                    if (j < i) hx_wal_close(rt->workers[j].wal);
+                }
+                free(rt->workers); free(rt);
+                return NULL;
+            }
         }
         if (cfg.data_dir && cfg.wal_mode != HELIX_WAL_OFF) {
             char path[512];
