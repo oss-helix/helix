@@ -1,73 +1,91 @@
 # Helix
 
-Distributed In-Memory State Runtime for High-Concurrency Applications.
+> **One runtime for fast reads and safe writes.**
 
-Helix moves concurrency control from databases into an execution runtime.
-
-## Why Helix?
-
-Modern applications struggle with:
-
-- database row locks
-- transaction contention
-- distributed locks
-- ordering guarantees
-- high write workloads
-
-Helix provides a runtime layer that manages application state in memory.
+Helix is a lightweight state runtime that combines high-performance
+in-memory access with per-key concurrency control.
 
 ```
-Request
-   |
-Helix Runtime
-   |
-In-Memory State
-   |
-Replication
-   |
-Persistence
+                Application
+                     |
+                     v
+                   Helix
+   ┌─────────────────────────────────┐
+   │  Read Path                      │
+   │    In-memory state              │
+   │    TTL / cache                  │
+   ├─────────────────────────────────┤
+   │  Write Path                     │
+   │    Event loop                   │
+   │    Single writer per key        │
+   │    Submission-order ordering    │
+   └─────────────────────────────────┘
+                     |
+                     v
+                Persistence
 ```
 
-## Core Concepts
+## What Helix replaces
 
-### Key-based Execution
-
-Each state key owns an execution context.
-
-Example:
+A typical small-to-mid backend looks like this:
 
 ```
-order:100
+Spring + Redis + DB
 ```
 
-is always processed by the same execution worker.
+Engineers spend time on:
 
-Guarantees:
+- cache key management
+- TTL / eviction policies
+- distributed lock implementation
+- concurrency control across instances
+- idempotency / dedup plumbing
 
-- same key → sequential execution
-- different keys → parallel execution
-
-No distributed lock required.
-
----
-
-## Architecture
+With Helix the stack collapses to:
 
 ```
-            Client
-              |
-        Helix Runtime
-              |
-       +----------------+
-       |   Event Loop   |
-       +----------------+
-              |
-        State Engine
-              |
-         Replication
-              |
-         Persistence
+Spring + Helix + DB
 ```
+
+The application reaches for two operations:
+
+```kotlin
+helix.put(key, value, ttl)         // read path — fast in-memory access
+helix.execute(key) { ... }         // write path — per-key serialization
+```
+
+Read path is a memory lookup. Write path is a queued, single-threaded
+execution per key — no DB row lock, no distributed mutex library, no
+retry loop in application code.
+
+## Design philosophy
+
+The two paths are unified at the daemon boundary but distinct internally:
+
+- **Cache** is a performance optimization. Stale-but-fast reads.
+  Bucketed concurrent map, TTL eviction, no ordering guarantees.
+- **State execution** is a correctness guarantee. Submission-order
+  per-key serialization, exactly one writer at a time, durable via
+  the write-ahead log.
+
+Mixing the two as a single primitive invites subtle consistency bugs
+under load. They share the same key space and the same daemon but the
+underlying mechanics stay separate.
+
+## Why this shape
+
+The big-co stack — Kafka + Redis + ZooKeeper + Postgres + a row-lock
+library — is already built. Helix isn't competing there.
+
+Helix targets the **smaller service** that has:
+
+- one or two app servers
+- a Postgres / MySQL
+- maybe a Redis used as a cache
+
+and is starting to see hot rows, inventory races, double-bookings, or
+duplicate-request bugs. Adding ZooKeeper + Redlock + custom Lua scripts
+is a heavy step. Adding Helix is one container and two API methods.
 
 ---
 
@@ -82,8 +100,12 @@ Implemented:
 - [x] Snapshot writer + WAL rotation
 - [x] Crash recovery (snapshot → WAL replay)
 - [x] HTTP lease daemon (per-key serialization over the wire)
-- [x] Read-through TTL cache
-- [x] Spring Boot + Kotlin reference client
+- [x] Read-through TTL cache (ephemeral or WAL-persistent)
+- [x] Idempotency endpoint (`POST /v1/idempotent`)
+- [x] Atomic ops (`POST /v1/atomic/{incr,cas}`)
+- [x] Prometheus metrics (`GET /v1/metrics`)
+- [x] Graceful shutdown / drain mode on SIGTERM
+- [x] Spring Boot + Kotlin reference client (lease / cache / idempotent / atomic)
 - [x] Docker / docker-compose deployment
 
 Planned:
@@ -91,53 +113,6 @@ Planned:
 - [ ] Leader / Follower replication
 - [ ] Cluster membership
 - [ ] Persistence adapters (Postgres / MySQL sinks)
-
----
-
-## When to use Helix
-
-Helix targets two problems that show up together in high-traffic backends:
-
-**Write contention.** Multiple requests fight over the same row — seat
-reservations, inventory decrements, balance updates, idempotency tokens.
-The lease daemon serializes all writers for a given key, in submission
-order, across every application instance. No DB row lock, no distributed
-mutex library, no retry loop in application code.
-
-**Read-heavy hotspots.** The same list / detail / discovery page hammered
-by thousands of concurrent users. The TTL cache module serves repeated
-reads from memory with per-entry expiry and cache-aside semantics, so
-the DB sees one read per cache miss instead of one read per request.
-
-Both run on the same daemon and share the same key space, so the
-application gets a single coordination point for both problems.
-
----
-
-## Design positioning
-
-Helix is not:
-
-- a database
-- a message broker
-
-Helix is:
-
-> A distributed state execution runtime — per-key serialization for
-> writes, TTL cache for reads, one daemon for both.
-
----
-
-## Language
-
-Helix is implemented in C.
-
-Goals:
-
-- predictable latency
-- explicit memory management
-- zero-copy where possible
-- low overhead runtime
 
 ---
 
@@ -163,6 +138,21 @@ seq 1 200 | xargs -P 50 -I{} curl -s -o /dev/null -w '%{http_code}\n' \
 
 Exactly one winner — the other 199 lost the lease race deterministically.
 See `examples/spring-kotlin/README.md` for the full walkthrough.
+
+---
+
+## Language
+
+Helix is implemented in C.
+
+Goals:
+
+- predictable latency
+- explicit memory management
+- zero-copy where possible
+- low overhead runtime
+
+---
 
 ## Status
 
